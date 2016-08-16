@@ -7,18 +7,81 @@
 import * as nls from 'vs/nls';
 import { KeyCode, KeyMod } from 'vs/base/common/keyCodes';
 import { IDisposable, dispose } from 'vs/base/common/lifecycle';
+import { forEach } from 'vs/base/common/collections';
+import { TPromise } from 'vs/base/common/winjs.base';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { ContextKeyExpr } from 'vs/platform/contextkey/common/contextkey';
-import { ICommonCodeEditor, IEditorContribution, EditorContextKeys, ModeContextKeys } from 'vs/editor/common/editorCommon';
+import { ICommonCodeEditor, IPosition, IEditorContribution, EditorContextKeys, ModeContextKeys } from 'vs/editor/common/editorCommon';
 import { editorAction, ServicesAccessor, EditorAction, EditorCommand, CommonEditorRegistry } from 'vs/editor/common/editorCommonExtensions';
 import { ISuggestSupport, SuggestRegistry } from 'vs/editor/common/modes';
 import { ICodeEditor } from 'vs/editor/browser/editorBrowser';
 import { EditorBrowserRegistry } from 'vs/editor/browser/editorBrowserExtensions';
 import { getSnippetController } from 'vs/editor/contrib/snippet/common/snippet';
-import { Context as SuggestContext } from 'vs/editor/contrib/suggest/common/suggest';
+import { provideSuggestionItems, ISuggestionItem , Context as SuggestContext } from 'vs/editor/contrib/suggest/common/suggest';
 import { SuggestModel } from '../common/suggestModel';
-import { CompletionItem } from '../common/completionModel';
+import { CompletionItem, CompletionModel } from '../common/completionModel';
 import { SuggestWidget } from './suggestWidget';
+
+class TriggerCharacterListener {
+
+	private _toDispose: IDisposable[] = [];
+	private _localDispose: IDisposable[] = [];
+
+	constructor(private _editor: ICodeEditor, private _controller: SuggestController) {
+		this._toDispose.push(_editor.onDidChangeConfiguration(() => this._update()));
+		this._toDispose.push(_editor.onDidChangeModel(() => this._update()));
+		this._toDispose.push(_editor.onDidChangeModelMode(() => this._update()));
+		this._toDispose.push(SuggestRegistry.onDidChange(this._update, this));
+
+		this._update();
+	}
+
+	dispose(): void {
+		dispose(this._toDispose);
+		dispose(this._localDispose);
+	}
+
+	private _update(): void {
+
+		this._localDispose = dispose(this._localDispose);
+
+		if (this._editor.getConfiguration().readOnly
+			|| !this._editor.getModel()
+			|| !this._editor.getConfiguration().contribInfo.suggestOnTriggerCharacters) {
+
+			return;
+		}
+
+		const providerByCh: { [ch: string]: ISuggestSupport[] } = Object.create(null);
+		for (const provider of SuggestRegistry.all(this._editor.getModel())) {
+
+			if (!provider.triggerCharacters) {
+				continue;
+			}
+
+			for (const ch of provider.triggerCharacters) {
+				const array = providerByCh[ch];
+				if (!array) {
+					providerByCh[ch] = [provider];
+				} else {
+					array.push(provider);
+				}
+			}
+		}
+
+		forEach(providerByCh, entry => {
+			this._localDispose.push(this._editor.addTypingListener(entry.key, () => {
+
+				const pos = this._editor.getPosition();
+				const promise = provideSuggestionItems(this._editor.getModel(), pos,
+					this._editor.getConfiguration().contribInfo.snippetSuggestions,
+					entry.value);
+
+				this._controller.trigger(pos, true, promise);
+			}));
+		});
+	}
+}
 
 export class SuggestController implements IEditorContribution {
 	private static ID: string = 'editor.contrib.suggestController';
@@ -29,7 +92,6 @@ export class SuggestController implements IEditorContribution {
 
 	private model: SuggestModel;
 	private widget: SuggestWidget;
-	private triggerCharacterListeners: IDisposable[];
 	private toDispose: IDisposable[] = [];
 
 	constructor(
@@ -45,16 +107,10 @@ export class SuggestController implements IEditorContribution {
 
 		this.toDispose.push(this.widget.onDidSelect(this.onDidSelectItem, this));
 
-		this.triggerCharacterListeners = [];
-
-		this.toDispose.push(editor.onDidChangeConfiguration(() => this.update()));
-		this.toDispose.push(editor.onDidChangeModel(() => this.update()));
-		this.toDispose.push(editor.onDidChangeModelMode(() => this.update()));
-		this.toDispose.push(SuggestRegistry.onDidChange(this.update, this));
-
 		this.toDispose.push(this.model.onDidAccept(e => getSnippetController(this.editor).run(e.snippet, e.overwriteBefore, e.overwriteAfter)));
 
-		this.update();
+		this.toDispose.push(new TriggerCharacterListener(this.editor, this));
+
 	}
 
 	getId(): string {
@@ -63,7 +119,6 @@ export class SuggestController implements IEditorContribution {
 
 	dispose(): void {
 		this.toDispose = dispose(this.toDispose);
-		this.triggerCharacterListeners = dispose(this.triggerCharacterListeners);
 
 		if (this.widget) {
 			this.widget.dispose();
@@ -84,53 +139,15 @@ export class SuggestController implements IEditorContribution {
 		this.model.accept(item.suggestion, overwriteBefore, overwriteAfter);
 	}
 
-	private update(): void {
+	trigger(position: IPosition, auto: boolean, promise: TPromise<ISuggestionItem[]>): void {
 
-		this.triggerCharacterListeners = dispose(this.triggerCharacterListeners);
+		this.widget.showTriggered({ auto, retrigger: false });
 
-		if (this.editor.getConfiguration().readOnly
-			|| !this.editor.getModel()
-			|| !this.editor.getConfiguration().contribInfo.suggestOnTriggerCharacters) {
-
-			return;
-		}
-
-		let groups = SuggestRegistry.orderedGroups(this.editor.getModel());
-		if (groups.length === 0) {
-			return;
-		}
-
-		let triggerCharacters: { [ch: string]: ISuggestSupport[][] } = Object.create(null);
-
-		groups.forEach(group => {
-
-			let groupTriggerCharacters: { [ch: string]: ISuggestSupport[] } = Object.create(null);
-
-			group.forEach(support => {
-				let localTriggerCharacters = support.triggerCharacters;
-				if (localTriggerCharacters) {
-					for (let ch of localTriggerCharacters) {
-						let array = groupTriggerCharacters[ch];
-						if (array) {
-							array.push(support);
-						} else {
-							array = [support];
-							groupTriggerCharacters[ch] = array;
-							if (triggerCharacters[ch]) {
-								triggerCharacters[ch].push(array);
-							} else {
-								triggerCharacters[ch] = [array];
-							}
-						}
-					}
-				}
-			});
-		});
-
-		Object.keys(triggerCharacters).forEach(ch => {
-			this.triggerCharacterListeners.push(this.editor.addTypingListener(ch, () => {
-				this.model.trigger(false, ch, false, triggerCharacters[ch]);
-			}));
+		promise.then(value => {
+			const model = new CompletionModel(value, this.editor.getModel().getLineContent(position.lineNumber).substr(position.column - 1));
+			this.widget.showSuggestions({ auto, completionModel: model, isFrozen: false });
+		}, err => {
+			this.widget.showDidCancel({ retrigger: false });
 		});
 	}
 

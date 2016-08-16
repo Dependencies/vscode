@@ -10,7 +10,7 @@ import {IDisposable, dispose} from 'vs/base/common/lifecycle';
 import {startsWith} from 'vs/base/common/strings';
 import {TPromise} from 'vs/base/common/winjs.base';
 import {ICommonCodeEditor, ICursorSelectionChangedEvent, CursorChangeReason, IModel, IPosition} from 'vs/editor/common/editorCommon';
-import {ISuggestSupport, ISuggestion, SuggestRegistry} from 'vs/editor/common/modes';
+import {ISuggestion, SuggestRegistry} from 'vs/editor/common/modes';
 import {CodeSnippet} from 'vs/editor/contrib/snippet/common/snippet';
 import {ISuggestionItem, provideSuggestionItems} from './suggest';
 import {CompletionModel} from './completionModel';
@@ -21,7 +21,6 @@ export interface ICancelEvent {
 
 export interface ITriggerEvent {
 	auto: boolean;
-	characterTriggered: boolean;
 	retrigger: boolean;
 }
 
@@ -282,7 +281,7 @@ export class SuggestModel implements IDisposable {
 		this.trigger(this.state === State.Auto, undefined, true);
 	}
 
-	trigger(auto: boolean, triggerCharacter?: string, retrigger: boolean = false, groups?: ISuggestSupport[][]): void {
+	trigger(auto: boolean, triggerCharacter?: string, retrigger: boolean = false): void {
 		const model = this.editor.getModel();
 
 		if (!model) {
@@ -290,9 +289,8 @@ export class SuggestModel implements IDisposable {
 		}
 
 		const characterTriggered = !!triggerCharacter;
-		groups = groups || SuggestRegistry.orderedGroups(model);
 
-		if (groups.length === 0) {
+		if (SuggestRegistry.orderedGroups(model).length === 0) {
 			return;
 		}
 
@@ -305,14 +303,14 @@ export class SuggestModel implements IDisposable {
 		// Cancel previous requests, change state & update UI
 		this.cancel(false, retrigger);
 		this.state = (auto || characterTriggered) ? State.Auto : State.Manual;
-		this._onDidTrigger.fire({ auto: this.isAutoSuggest(), characterTriggered, retrigger });
+		this._onDidTrigger.fire({ auto: this.isAutoSuggest(), retrigger });
 
 		// Capture context when request was sent
 		this.context = ctx;
 
 		const position = this.editor.getPosition();
 
-		this.requestPromise = provideSuggestionItems(model, position, { groups, snippetConfig: this.editor.getConfiguration().contribInfo.snippetSuggestions }).then(all => {
+		this.requestPromise = provideSuggestionItems(model, position, this.editor.getConfiguration().contribInfo.snippetSuggestions).then(all => {
 			this.requestPromise = null;
 
 			if (this.state === State.Idle) {
