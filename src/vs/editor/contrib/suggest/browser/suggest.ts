@@ -11,15 +11,16 @@ import { forEach } from 'vs/base/common/collections';
 import { TPromise } from 'vs/base/common/winjs.base';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { ContextKeyExpr } from 'vs/platform/contextkey/common/contextkey';
-import { ICommonCodeEditor, IPosition, IEditorContribution, EditorContextKeys, ModeContextKeys } from 'vs/editor/common/editorCommon';
+import { ICommonCodeEditor, IPosition, ICursorSelectionChangedEvent, CursorChangeReason, IEditorContribution, EditorContextKeys, ModeContextKeys } from 'vs/editor/common/editorCommon';
 import { editorAction, ServicesAccessor, EditorAction, EditorCommand, CommonEditorRegistry } from 'vs/editor/common/editorCommonExtensions';
 import { ISuggestSupport, SuggestRegistry } from 'vs/editor/common/modes';
 import { ICodeEditor } from 'vs/editor/browser/editorBrowser';
+import { Position } from 'vs/editor/common/core/position';
 import { EditorBrowserRegistry } from 'vs/editor/browser/editorBrowserExtensions';
 import { getSnippetController } from 'vs/editor/contrib/snippet/common/snippet';
 import { provideSuggestionItems, ISuggestionItem , Context as SuggestContext } from 'vs/editor/contrib/suggest/common/suggest';
 import { SuggestModel } from '../common/suggestModel';
-import { CompletionItem, CompletionModel } from '../common/completionModel';
+import { CompletionItem } from '../common/completionModel';
 import { SuggestWidget } from './suggestWidget';
 
 class TriggerCharacterListener {
@@ -83,6 +84,100 @@ class TriggerCharacterListener {
 	}
 }
 
+class Word {
+
+	static strictUntilPosition(editor: ICommonCodeEditor, position: IPosition): Word {
+		const word = editor.getModel().getWordAtPosition(position);
+		if (word
+			&& word.endColumn === position.column
+			&& isNaN(Number(word.word))) {
+
+			return new Word(position.lineNumber, word.startColumn, word.endColumn, word.word);
+		}
+	}
+
+	constructor(public line: number, public startColumn: number, public endColumn: number, public value: string) {
+
+	}
+
+	isContinuation(word: Word): boolean {
+		const {line, startColumn, endColumn, value} = word;
+
+		// same start line/column, greater end column
+		if (this.line !== line
+			|| this.startColumn !== startColumn
+			|| this.endColumn >= endColumn) {
+
+			return false;
+		}
+
+		// same text
+		return value.indexOf(this.value) === 0;
+	}
+}
+
+class WordListener {
+
+	private _toDispose: IDisposable[] = [];
+	private _quickSuggestDelay: number;
+	private _currentWord: Word;
+	private _currentTriggerHandle: number;
+
+	constructor(private _editor: ICodeEditor, private _controller: SuggestController) {
+		this._toDispose.push(this._editor.onDidChangeConfiguration(() => this._handleConfigurationChange()));
+		this._toDispose.push(this._editor.onDidChangeCursorSelection(e => this._handleCursorChange(e)));
+
+		this._handleConfigurationChange();
+	}
+
+	dispose() {
+		dispose(this._toDispose);
+		clearTimeout(this._currentTriggerHandle);
+	}
+
+	private _handleCursorChange(e: ICursorSelectionChangedEvent): void {
+
+		if (this._quickSuggestDelay < 0
+			|| !e.selection.isEmpty()
+			|| e.source !== 'keyboard'
+			|| e.reason !== CursorChangeReason.NotSet) {
+
+			this._controller.cancelSuggestWidget();
+			return;
+		}
+
+		const position = new Position(e.selection.positionLineNumber, e.selection.positionColumn);
+		const word = Word.strictUntilPosition(this._editor, position);
+
+		if (!word) {
+			this._currentWord = undefined;
+			this._controller.cancelSuggestWidget();
+			return;
+		}
+
+		if (!this._currentWord
+			|| !this._currentWord.isContinuation(word)) {
+
+			clearTimeout(this._currentTriggerHandle);
+			this._currentTriggerHandle = setTimeout(() => {
+				const promise = provideSuggestionItems(this._editor.getModel(), position, this._editor.getConfiguration().contribInfo.snippetSuggestions);
+				this._controller.trigger(position, true, promise);
+			}, this._quickSuggestDelay);
+		}
+
+		this._currentWord = word;
+	}
+
+	private _handleConfigurationChange(): void {
+		if (!this._editor.getConfiguration().contribInfo.quickSuggestions) {
+			this._quickSuggestDelay = -1;
+		} else {
+			let value = this._editor.getConfiguration().contribInfo.quickSuggestionsDelay;
+			this._quickSuggestDelay = isNaN(value) || value < 10 ? 10 : value;
+		}
+	}
+}
+
 export class SuggestController implements IEditorContribution {
 	private static ID: string = 'editor.contrib.suggestController';
 
@@ -110,6 +205,7 @@ export class SuggestController implements IEditorContribution {
 		this.toDispose.push(this.model.onDidAccept(e => getSnippetController(this.editor).run(e.snippet, e.overwriteBefore, e.overwriteAfter)));
 
 		this.toDispose.push(new TriggerCharacterListener(this.editor, this));
+		this.toDispose.push(new WordListener(this.editor, this));
 
 	}
 
@@ -141,14 +237,18 @@ export class SuggestController implements IEditorContribution {
 
 	trigger(position: IPosition, auto: boolean, promise: TPromise<ISuggestionItem[]>): void {
 
-		this.widget.showTriggered({ auto, retrigger: false });
-
-		promise.then(value => {
-			const model = new CompletionModel(value, this.editor.getModel().getLineContent(position.lineNumber).substr(position.column - 1));
-			this.widget.showSuggestions({ auto, completionModel: model, isFrozen: false });
-		}, err => {
-			this.widget.showDidCancel({ retrigger: false });
+		promise.then(items => {
+			console.log('NEW', position, auto, items.length);
 		});
+
+		// this.widget.showTriggered({ auto, retrigger: false });
+
+		// promise.then(value => {
+		// 	const model = new CompletionModel(value, this.editor.getModel().getLineContent(position.lineNumber).substr(position.column - 1));
+		// 	this.widget.showSuggestions({ auto, completionModel: model, isFrozen: false });
+		// }, err => {
+		// 	this.widget.showDidCancel({ retrigger: false });
+		// });
 	}
 
 	triggerSuggest(): void {
@@ -164,6 +264,7 @@ export class SuggestController implements IEditorContribution {
 	}
 
 	cancelSuggestWidget(): void {
+		console.log('CANCEL');
 		if (this.widget) {
 			this.widget.cancel();
 		}
