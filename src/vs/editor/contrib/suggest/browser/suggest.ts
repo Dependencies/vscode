@@ -23,6 +23,99 @@ import { SuggestModel } from '../common/suggestModel';
 import { CompletionItem } from '../common/completionModel';
 import { SuggestWidget } from './suggestWidget';
 
+namespace suggestStateMachine {
+
+	export enum State {
+		Idle,
+		LoadingAuto,
+		ResultAuto,
+		ResultAutoIncomplete,
+		LoadingExplict,
+		ResultExplicit,
+		ResultExplicitIncomplete,
+		ResultExplicitFroozen,
+		ResultExplicitEmpty
+	}
+
+	export enum Message {
+		Cancel,
+		Explicit,
+		TriggerCharacterTyped,
+		WordStarted,
+		WordEnded,
+		WordContinued,
+		Result,
+		ResultEmpty,
+		ResultIncomple
+	}
+
+	const fma: { [state: number]: { [message: number]: State; } } = Object.create(null);
+
+	fma[State.Idle] = {
+		[Message.Explicit]: State.LoadingExplict,
+		[Message.TriggerCharacterTyped]: State.LoadingAuto,
+		[Message.WordStarted]: State.LoadingAuto
+	};
+
+	fma[State.LoadingAuto] = {
+		[Message.ResultEmpty]: State.Idle,
+		[Message.ResultIncomple]: State.ResultAutoIncomplete,
+		[Message.Result]: State.ResultAuto
+	};
+
+	fma[State.ResultAuto] = {
+		[Message.WordContinued]: State.ResultAuto,
+		[Message.ResultEmpty]: State.Idle
+	};
+
+	fma[State.ResultAutoIncomplete] = {
+		[Message.WordContinued]: State.LoadingAuto
+	};
+
+	fma[State.LoadingExplict] = {
+		[Message.ResultEmpty]: State.ResultExplicitEmpty,
+		[Message.ResultIncomple]: State.ResultExplicitIncomplete,
+		[Message.Result]: State.ResultExplicit
+	};
+
+	fma[State.ResultExplicit] = {
+		[Message.WordContinued]: State.ResultExplicit,
+		[Message.ResultEmpty]: State.ResultExplicitFroozen
+	};
+
+	// * ->
+	fma[-1] = {
+		[Message.Cancel]: State.Idle,
+		[Message.WordEnded]: State.Idle,
+		[Message.TriggerCharacterTyped]: State.LoadingAuto
+	};
+
+	let currentState = State.Idle;
+
+	export function current(): State {
+		return currentState;
+	}
+
+	export function advance(message: Message): State {
+		let result = fma[currentState][message];
+		if (typeof result === 'undefined') {
+			result = fma[-1][message];
+		}
+
+		if (typeof result === 'undefined') {
+			throw new Error(`illegal transition from ${State[currentState]} with ${Message[message]}`);
+		}
+
+		console.log(`from '${State[currentState]}' with '${Message[message]}' to '${State[result]}'`);
+		currentState = result;
+		return result;
+	}
+
+	export function reset(): void {
+		currentState = State.Idle;
+	}
+}
+
 class TriggerCharacterListener {
 
 	private _toDispose: IDisposable[] = [];
@@ -77,6 +170,8 @@ class TriggerCharacterListener {
 				const promise = provideSuggestionItems(this._editor.getModel(), pos,
 					this._editor.getConfiguration().contribInfo.snippetSuggestions,
 					entry.value);
+
+				suggestStateMachine.advance(suggestStateMachine.Message.TriggerCharacterTyped);
 
 				this._controller.trigger(pos, true, promise);
 			}));
